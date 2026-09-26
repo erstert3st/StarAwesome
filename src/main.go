@@ -27,6 +27,7 @@ type config struct {
 	verbose  bool
 	headline bool
 	version  bool
+	complete string
 	stale    string
 	rank     rankOptions
 }
@@ -38,6 +39,14 @@ func main() {
 	cfg := parseFlags()
 	if cfg.version {
 		fmt.Println("starawesome", versionString())
+		return
+	}
+	if cfg.complete != "" {
+		if cfg.complete != "zsh" {
+			fmt.Fprintf(os.Stderr, "error: unknown -completion %q (want zsh)\n", cfg.complete)
+			os.Exit(1)
+		}
+		writeZshCompletion(os.Stdout, flag.CommandLine)
 		return
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
@@ -62,6 +71,7 @@ func parseFlags() config {
 	flag.IntVar(&cfg.rank.top, "top", 0, "show only the first N repos (per headline with -headline/md), 0 = all")
 	flag.StringVar(&cfg.stale, "stale", "", "mark repos without a commit for this long, e.g. 90d, 6w, 18m, 2y")
 	flag.BoolVar(&cfg.version, "version", false, "print version and exit")
+	flag.StringVar(&cfg.complete, "completion", "", "print shell completion script and exit: zsh")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "usage: %s [flags] [SOURCE]\n\n", os.Args[0])
 		fmt.Fprintln(os.Stderr, "SOURCE: GitHub repo URL, raw markdown URL, local file, or - / empty for stdin.")

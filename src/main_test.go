@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"flag"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -418,5 +419,24 @@ func TestReadSourceLocalFile(t *testing.T) {
 	md, self, err := readSource(context.Background(), testClient(0), path)
 	if err != nil || md != "# local" || self != nil {
 		t.Fatalf("readSource = %q, %v, %v", md, self, err)
+	}
+}
+
+func TestWriteZshCompletion(t *testing.T) {
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	fs.Bool("v", false, "be verbose")
+	fs.String("format", "table", "it's [a]: b")
+	var buf bytes.Buffer
+	writeZshCompletion(&buf, fs)
+	out := buf.String()
+	for _, want := range []string{
+		`'-v[be verbose]' \`,
+		`'-format[it'\''s \[a\]\: b]:format:' \`,
+		`'1:source:_files'`,
+		"compdef _starawesome starawesome",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q in:\n%s", want, out)
+		}
 	}
 }

@@ -28,6 +28,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - A `fetchFunc` must return exactly one `Result` per input repo.
 - The token is only sent when the request URL matches `Client.apiBase` (scheme + host). Never loosen this; `readSource` fetches user-supplied URLs.
 - All untrusted text (descriptions, headings, links, error bodies) must pass through `oneLine` before printing, to block terminal escape injection.
+- zsh completion (`completion.go`) is generated from `flag.CommandLine`; new flags need no extra completion work, but their usage text becomes the completion description.
 - `LAST COMMIT` means the default branch's last commit with GraphQL, but `pushed_at` (any branch) with REST.
 
 Tests live in `src/main_test.go` and use `httptest.Server` with `Client.apiBase` pointed at it (`apiServer` helper).
