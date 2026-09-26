@@ -5,7 +5,7 @@ Ranks the GitHub repos of an awesome list by stars.
 ## Build
 
 ```sh
-go build -o starawesome .
+go build -o starawesome ./src
 ```
 
 ## Usage
