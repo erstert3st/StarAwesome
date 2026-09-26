@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 )
 
 type Result struct {
@@ -18,6 +19,7 @@ type Result struct {
 	Stars       int
 	Description string
 	Archived    bool
+	LastCommit  time.Time // zero if unknown (e.g. empty repo)
 	Err         error
 }
 
@@ -81,13 +83,16 @@ func (c *Client) fetchREST(ctx context.Context, repos []Repo) []Result {
 			Stars       int    `json:"stargazers_count"`
 			Description string `json:"description"`
 			Archived    bool   `json:"archived"`
+			// REST would need an extra request per repo for the default
+			// branch's last commit; pushed_at is the closest free signal.
+			PushedAt time.Time `json:"pushed_at"`
 		}
 		if err := json.Unmarshal(body, &r); err != nil {
 			out[i].Err = fmt.Errorf("decode response: %w", err)
 			continue
 		}
-		out[i].FullName, out[i].URL, out[i].Stars, out[i].Description, out[i].Archived =
-			r.FullName, r.HTMLURL, r.Stars, r.Description, r.Archived
+		out[i].FullName, out[i].URL, out[i].Stars, out[i].Description, out[i].Archived, out[i].LastCommit =
+			r.FullName, r.HTMLURL, r.Stars, r.Description, r.Archived, r.PushedAt
 	}
 	return out
 }
@@ -98,6 +103,12 @@ type graphQLRepo struct {
 	StargazerCount int    `json:"stargazerCount"`
 	Description    string `json:"description"`
 	IsArchived     bool   `json:"isArchived"`
+	// DefaultBranchRef is nil for empty repos.
+	DefaultBranchRef *struct {
+		Target struct {
+			CommittedDate time.Time `json:"committedDate"`
+		} `json:"target"`
+	} `json:"defaultBranchRef"`
 }
 
 // fetchGraphQL resolves a whole batch with one aliased GraphQL query.
@@ -106,7 +117,7 @@ func (c *Client) fetchGraphQL(ctx context.Context, repos []Repo) []Result {
 	vars := map[string]string{}
 	for i, repo := range repos {
 		params = append(params, fmt.Sprintf("$o%d: String!, $n%d: String!", i, i))
-		fields = append(fields, fmt.Sprintf("r%d: repository(owner: $o%d, name: $n%d) { nameWithOwner url stargazerCount description isArchived }", i, i, i))
+		fields = append(fields, fmt.Sprintf("r%d: repository(owner: $o%d, name: $n%d) { nameWithOwner url stargazerCount description isArchived defaultBranchRef { target { ... on Commit { committedDate } } } }", i, i, i))
 		vars[fmt.Sprintf("o%d", i)] = repo.Owner
 		vars[fmt.Sprintf("n%d", i)] = repo.Name
 	}
@@ -162,6 +173,9 @@ func (c *Client) fetchGraphQL(ctx context.Context, repos []Repo) []Result {
 		case node != nil:
 			out[i].FullName, out[i].URL, out[i].Stars, out[i].Description, out[i].Archived =
 				node.NameWithOwner, node.URL, node.StargazerCount, node.Description, node.IsArchived
+			if node.DefaultBranchRef != nil {
+				out[i].LastCommit = node.DefaultBranchRef.Target.CommittedDate
+			}
 		case aliasErrs[alias] != nil:
 			out[i].Err = aliasErrs[alias]
 		default:

@@ -11,8 +11,10 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"runtime/debug"
 	"slices"
 	"strings"
+	"time"
 )
 
 type config struct {
@@ -24,10 +26,20 @@ type config struct {
 	batch    int
 	verbose  bool
 	headline bool
+	version  bool
+	stale    string
+	rank     rankOptions
 }
+
+// version is set for release builds via -ldflags "-X main.version=...".
+var version string
 
 func main() {
 	cfg := parseFlags()
+	if cfg.version {
+		fmt.Println("starawesome", versionString())
+		return
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 	if err := run(ctx, cfg); err != nil {
@@ -45,7 +57,11 @@ func parseFlags() config {
 	flag.IntVar(&cfg.batch, "batch", 50, "repos per GraphQL request")
 	flag.BoolVar(&cfg.verbose, "v", false, "list every skipped non-GitHub link")
 	flag.BoolVar(&cfg.headline, "headline", false, "keep the list's headlines and rank by stars within each (md always does)")
-	flag.BoolVar(&cfg.headline, "h", false, "shorthand for -headline")
+	flag.StringVar(&cfg.rank.sortBy, "sort", "stars", "sort by: stars | commit (newest last commit first)")
+	flag.IntVar(&cfg.rank.minStars, "min-stars", 0, "hide repos with fewer stars")
+	flag.IntVar(&cfg.rank.top, "top", 0, "show only the first N repos (per headline with -headline/md), 0 = all")
+	flag.StringVar(&cfg.stale, "stale", "", "mark repos without a commit for this long, e.g. 90d, 6w, 18m, 2y")
+	flag.BoolVar(&cfg.version, "version", false, "print version and exit")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "usage: %s [flags] [SOURCE]\n\n", os.Args[0])
 		fmt.Fprintln(os.Stderr, "SOURCE: GitHub repo URL, raw markdown URL, local file, or - / empty for stdin.")
@@ -63,6 +79,16 @@ func run(ctx context.Context, cfg config) error {
 	}
 	if cfg.workers < 1 || cfg.batch < 1 || cfg.retries < 0 {
 		return errors.New("-workers and -batch must be >= 1, -retries >= 0")
+	}
+	if cfg.rank.sortBy != "stars" && cfg.rank.sortBy != "commit" {
+		return fmt.Errorf("unknown -sort %q (want stars or commit)", cfg.rank.sortBy)
+	}
+	if cfg.rank.minStars < 0 || cfg.rank.top < 0 {
+		return errors.New("-min-stars and -top must be >= 0")
+	}
+	staleBefore, err := staleCutoff(cfg.stale, time.Now())
+	if err != nil {
+		return err
 	}
 	if flag.NArg() > 1 {
 		return fmt.Errorf("expected at most one SOURCE, got %d", flag.NArg())
@@ -106,13 +132,14 @@ func run(ctx context.Context, cfg config) error {
 		ranked = append(ranked, s.Results...)
 	}
 
-	switch {
-	case cfg.format == "md":
-		writeMarkdown(os.Stdout, sections)
-	case cfg.headline:
-		writeTable(os.Stdout, sections, isTerminal(os.Stdout))
-	default:
-		writeTable(os.Stdout, []section{{Results: ranked}}, isTerminal(os.Stdout))
+	if cfg.format == "table" && !cfg.headline {
+		sections = []section{{Results: ranked}}
+	}
+	sections = rankSections(sections, cfg.rank)
+	if cfg.format == "md" {
+		writeMarkdown(os.Stdout, sections, staleBefore)
+	} else {
+		writeTable(os.Stdout, sections, staleBefore, isTerminal(os.Stdout))
 	}
 	report(failed, parsed.Skipped, len(ranked), cfg.verbose)
 	return nil
@@ -134,6 +161,17 @@ func chooseAPI(cfg config, token string, c *Client) (fetchFunc, int, error) {
 	default:
 		return nil, 0, fmt.Errorf("unknown -api %q (want auto, graphql or rest)", cfg.api)
 	}
+}
+
+// versionString falls back to the module version embedded by `go install`.
+func versionString() string {
+	if version != "" {
+		return version
+	}
+	if info, ok := debug.ReadBuildInfo(); ok && info.Main.Version != "" && info.Main.Version != "(devel)" {
+		return info.Main.Version
+	}
+	return "dev"
 }
 
 func findToken() string {

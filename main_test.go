@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -201,9 +202,100 @@ func TestOneLineStripsControlCharacters(t *testing.T) {
 func TestWriteTableStripsEscapes(t *testing.T) {
 	var buf bytes.Buffer
 	sections := []section{{Title: "T\x1b[2J", Results: []Result{{FullName: "o/a", Description: "hi\x1b]0;x\x07"}}}}
-	writeTable(&buf, sections, false)
+	writeTable(&buf, sections, time.Time{}, false)
 	if strings.ContainsAny(buf.String(), "\x1b\x07") {
 		t.Errorf("output contains control characters: %q", buf.String())
+	}
+}
+
+func TestWriteTableShowsLastCommit(t *testing.T) {
+	var buf bytes.Buffer
+	results := []Result{
+		{FullName: "o/a", Stars: 2, LastCommit: time.Date(2021, 3, 4, 0, 0, 0, 0, time.UTC)},
+		{FullName: "o/empty", Stars: 1},
+	}
+	writeTable(&buf, []section{{Results: results}}, time.Time{}, false)
+	lines := strings.Split(buf.String(), "\n")
+	if !strings.Contains(lines[0], "LAST COMMIT") || !strings.Contains(lines[1], "2021-03-04") || !strings.Contains(lines[2], "o/empty  -") {
+		t.Errorf("table =\n%s", buf.String())
+	}
+}
+
+func TestRankSections(t *testing.T) {
+	day := func(d int) time.Time { return time.Date(2024, 1, d, 0, 0, 0, 0, time.UTC) }
+	sections := []section{
+		{Title: "A", Results: []Result{
+			{FullName: "o/old", Stars: 30, LastCommit: day(1)},
+			{FullName: "o/new", Stars: 20, LastCommit: day(9)},
+			{FullName: "o/empty", Stars: 40},
+			{FullName: "o/tiny", Stars: 1, LastCommit: day(20)},
+		}},
+		{Title: "B", Results: []Result{{FullName: "o/small", Stars: 2}}},
+	}
+	names := func(s []section) []string {
+		var out []string
+		for _, sec := range s {
+			for _, r := range sec.Results {
+				out = append(out, sec.Title+":"+r.FullName)
+			}
+		}
+		return out
+	}
+	for _, tc := range []struct {
+		opts rankOptions
+		want []string
+	}{
+		{rankOptions{sortBy: "stars"}, []string{"A:o/empty", "A:o/old", "A:o/new", "A:o/tiny", "B:o/small"}},
+		{rankOptions{sortBy: "commit"}, []string{"A:o/tiny", "A:o/new", "A:o/old", "A:o/empty", "B:o/small"}},
+		{rankOptions{sortBy: "stars", minStars: 5}, []string{"A:o/empty", "A:o/old", "A:o/new"}},
+		{rankOptions{sortBy: "commit", minStars: 2, top: 1}, []string{"A:o/new", "B:o/small"}},
+	} {
+		if got := names(rankSections(sections, tc.opts)); !slices.Equal(got, tc.want) {
+			t.Errorf("%+v: got %v, want %v", tc.opts, got, tc.want)
+		}
+	}
+}
+
+func TestStaleCutoff(t *testing.T) {
+	now := time.Date(2026, 3, 31, 12, 0, 0, 0, time.UTC)
+	for age, want := range map[string]time.Time{
+		"":    {},
+		"10d": time.Date(2026, 3, 21, 12, 0, 0, 0, time.UTC),
+		"2w":  time.Date(2026, 3, 17, 12, 0, 0, 0, time.UTC),
+		"6m":  time.Date(2025, 10, 1, 12, 0, 0, 0, time.UTC), // Sep 31 normalizes to Oct 1
+		"2y":  time.Date(2024, 3, 31, 12, 0, 0, 0, time.UTC),
+	} {
+		if got, err := staleCutoff(age, now); err != nil || !got.Equal(want) {
+			t.Errorf("staleCutoff(%q) = %v, %v; want %v", age, got, err, want)
+		}
+	}
+	for _, bad := range []string{"2", "y", "-1y", "1.5y", "3h", "99999999999999999999d"} {
+		if _, err := staleCutoff(bad, now); err == nil {
+			t.Errorf("staleCutoff(%q): expected error", bad)
+		}
+	}
+}
+
+func TestStaleMarking(t *testing.T) {
+	cutoff := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+	sections := []section{{Results: []Result{
+		{FullName: "o/old", LastCommit: cutoff.AddDate(0, 0, -1)},
+		{FullName: "o/fresh", LastCommit: cutoff.AddDate(0, 0, 1)},
+		{FullName: "o/empty"},
+	}}}
+	var table, md bytes.Buffer
+	writeTable(&table, sections, cutoff, false)
+	writeMarkdown(&md, sections, cutoff)
+	if got := strings.Count(table.String(), "[stale]"); got != 1 || !strings.Contains(table.String(), "o/old    2023-12-31   [stale]") {
+		t.Errorf("table =\n%s", table.String())
+	}
+	if got := strings.Count(md.String(), "*(stale)*"); got != 1 || !strings.Contains(md.String(), "[o/old]() *(stale)*") {
+		t.Errorf("md =\n%s", md.String())
+	}
+	var tty bytes.Buffer
+	writeTable(&tty, sections, cutoff, true)
+	if !strings.Contains(tty.String(), "\x1b[2m") {
+		t.Errorf("terminal output not dimmed: %q", tty.String())
 	}
 }
 
@@ -252,10 +344,11 @@ func TestFetchREST(t *testing.T) {
 			http.NotFound(w, r)
 			return
 		}
-		w.Write([]byte(`{"full_name":"o/a","html_url":"https://github.com/o/a","stargazers_count":7,"description":"d","archived":true}`))
+		w.Write([]byte(`{"full_name":"o/a","html_url":"https://github.com/o/a","stargazers_count":7,"description":"d","archived":true,"pushed_at":"2024-05-06T07:08:09Z"}`))
 	})
 	got := c.fetchREST(context.Background(), []Repo{{"o", "a"}, {"o", "missing"}})
-	want := Result{Repo: Repo{"o", "a"}, FullName: "o/a", URL: "https://github.com/o/a", Stars: 7, Description: "d", Archived: true}
+	want := Result{Repo: Repo{"o", "a"}, FullName: "o/a", URL: "https://github.com/o/a", Stars: 7, Description: "d", Archived: true,
+		LastCommit: time.Date(2024, 5, 6, 7, 8, 9, 0, time.UTC)}
 	if got[0] != want {
 		t.Errorf("result 0 = %+v, want %+v", got[0], want)
 	}
@@ -276,12 +369,12 @@ func TestFetchGraphQL(t *testing.T) {
 			return
 		}
 		w.Write([]byte(`{
-			"data": {"r0": {"nameWithOwner":"o/a","url":"https://github.com/o/a","stargazerCount":3,"description":"d","isArchived":false}, "r1": null, "r2": null},
+			"data": {"r0": {"nameWithOwner":"o/a","url":"https://github.com/o/a","stargazerCount":3,"description":"d","isArchived":false,"defaultBranchRef":{"target":{"committedDate":"2023-01-02T03:04:05Z"}}}, "r1": null, "r2": null},
 			"errors": [{"type":"NOT_FOUND","message":"Could not resolve","path":["r1"]}]
 		}`))
 	})
 	got := c.fetchGraphQL(context.Background(), []Repo{{"o", "a"}, {"o", "gone"}, {"o", "b"}})
-	if got[0].FullName != "o/a" || got[0].Stars != 3 || got[0].Err != nil {
+	if got[0].FullName != "o/a" || got[0].Stars != 3 || got[0].Err != nil || formatDate(got[0].LastCommit) != "2023-01-02" {
 		t.Errorf("result 0 = %+v", got[0])
 	}
 	if got[1].Err == nil || got[1].Err.Error() != "Could not resolve" {
